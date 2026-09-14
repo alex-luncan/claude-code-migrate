@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*_to-transfer.zip
+*_MIGRATION_REPORT.md
+.DS_Store
+Thumbs.db
