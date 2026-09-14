@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 *_to-transfer.zip
 *_MIGRATION_REPORT.md
+*.skill
 .DS_Store
 Thumbs.db

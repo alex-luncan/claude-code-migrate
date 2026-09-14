@@ -91,11 +91,22 @@ Copy-Item -Recurse claude-code-migrate "$env:USERPROFILE\.claude\skills\osmigrat
 
 Restart `claude`. Install it on **both** machines, so you can migrate in either direction.
 
-**Option B – project‑local**
+**Option B – download the packaged skill**
+
+Download [`osmigration.skill`](https://github.com/alex-luncan/claude-code-migrate/releases/latest/download/osmigration.skill) from the [latest release](https://github.com/alex-luncan/claude-code-migrate/releases/latest). It's a zip of the skill folder, so extract it into your skills directory and restart `claude`:
+
+```bash
+mkdir -p ~/.claude/skills && unzip osmigration.skill -d ~/.claude/skills/     # macOS
+# or on Windows (PowerShell):
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
+tar -xf osmigration.skill -C "$env:USERPROFILE\.claude\skills"
+```
+
+**Option C – project‑local**
 
 Put the folder at `.claude/skills/osmigration/` inside a project.
 
-**Option C – script only**
+**Option D – script only**
 
 `scripts/migrate.py` is standalone Python 3.8+ with no dependencies. Use it without Claude at all (see below).
 
