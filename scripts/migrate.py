@@ -30,7 +30,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 STATE_FILE = ".osmigration-state.json"
 REPORT_MD = "MIGRATION_REPORT.md"
 EXTRAS_DIR = "_claude-global-extras"
@@ -42,6 +42,8 @@ DEFAULT_EXCLUDE_DIRS = {
     "target", "obj", ".gradle", "coverage", ".parcel-cache", ".svelte-kit", ".angular",
     "site-packages", ".eggs",
 }
+# Hold platform-specific native binaries: never copied, even with --keep.
+NEVER_COPY_DIRS = {"node_modules", ".venv", "venv", "site-packages", "__pycache__"}
 JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini", "ehthumbs.db"}
 JUNK_PREFIXES = ("._",)          # AppleDouble resource forks
 JUNK_DIRS = {"__MACOSX"}
@@ -53,6 +55,9 @@ BINARY_EXT = {
     ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi", ".wav",
     ".ogg", ".flac", ".db", ".sqlite", ".sqlite3", ".bin", ".dat", ".parquet", ".npy",
     ".npz", ".pkl", ".pickle", ".h5", ".hdf5", ".docx", ".xlsx", ".pptx", ".psd",
+    ".doc", ".xls", ".ppt", ".odt", ".ods", ".odp", ".wasm", ".webm", ".mkv", ".m4a", ".aac",
+    ".heic", ".avif", ".icns", ".lockb", ".p12", ".pfx", ".der", ".jks", ".keystore", ".apk",
+    ".ipa", ".dmg", ".iso", ".msi", ".deb", ".rpm", ".whl", ".node", ".pdb", ".glb", ".blend",
 }
 CRLF_ON_WINDOWS_EXT = {".bat", ".cmd", ".ps1"}
 
@@ -66,6 +71,8 @@ SCAN_TEXT_EXT = {
 
 WIN_ABS_RE = re.compile(r'(?<![A-Za-z0-9])([A-Za-z]:(?:\\\\|\\|/)[^\s"\'<>|,;)\]]*)')
 MAC_ABS_RE = re.compile(r'(?<![\w/.])(/(?:Users|home|opt/homebrew|usr/local|Volumes)/[^\s"\'<>|,;)\]]*)')
+# Git Bash / Claude Code permission-rule spelling of Windows paths: /c/Users/..., //c/Users/...
+MSYS_ABS_RE = re.compile(r'(?<![\w/.:])(/{1,2}[A-Za-z]/(?:Users|Program Files|ProgramData|Windows)/[^\s"\'<>|,;)\]]*)')
 WIN_ENV_RE = re.compile(r'%[A-Za-z_][A-Za-z0-9_()]*%')
 UNIX_ENV_RE = re.compile(r'\$\{?[A-Z_][A-Z0-9_]*\}?')
 
@@ -89,9 +96,18 @@ UNIX_SHELL_MARKERS = [
     (re.compile(r'#!/(?:usr/)?bin/'), "shebang (needs Git Bash / WSL on Windows)"),
     (re.compile(r'\bsource\s+\S+|\B\.\s+\S+\.sh\b'), "'source' a shell file"),
 ]
+# Commands that don't exist in Git Bash on Windows (bash syntax itself is fine there).
+MAC_ONLY_MARKERS = [
+    (re.compile(r'\b(?:brew|open|pbcopy|pbpaste|osascript|launchctl|mdfind|ditto|xattr|codesign)\b(?=\s|$)'), "macOS-only command"),
+    (re.compile(r"\bsed\s+-i\s*(?:''|\"\")"), "BSD 'sed -i \"\"' syntax"),
+    (re.compile(r'(?<![\w/.])/(?:opt/homebrew|Applications|Users|Volumes)/'), "macOS absolute path"),
+]
+SECRET_KEY_RE = re.compile(r'(?i)(token|secret|passw|api[_-]?key|access[_-]?key|private[_-]?key|credential|auth)')
+# A string that looks like a Windows path (not e.g. a regex such as \d+\.js$).
+WIN_PATH_ARG_RE = re.compile(r'^(?:[A-Za-z]:\\|\.{1,2}\\|[\w .@+~-]+\\[\w .@+~-])[\w .@+~()\\:-]*$')
 NPM_CMD_SHIMS = {"npx", "npm", "yarn", "pnpm", "tsc", "tsx", "ts-node", "node-gyp", "uvx"}
 WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
-WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+WINDOWS_ILLEGAL_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 
 
 # --------------------------------------------------------------------------- helpers
@@ -141,10 +157,86 @@ def load_json_loose(text: str):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        stripped = re.sub(r'/\*.*?\*/', '', text, flags=re.S)
-        stripped = re.sub(r'^\s*//.*$', '', stripped, flags=re.M)
-        stripped = re.sub(r',(\s*[}\]])', r'\1', stripped)
-        return json.loads(stripped)
+        return json.loads(strip_jsonc(text))
+
+
+def strip_jsonc(text: str) -> str:
+    """Remove comments and trailing commas outside of string literals (globs like src/**/*.ts survive)."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            out.append(c)
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j == -1 else j
+            continue
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        elif c == ",":
+            k = i + 1
+            while k < n and text[k] in " \t\r\n":
+                k += 1
+            if k < n and text[k] in "}]":
+                i += 1
+                continue
+            out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def check_dest_root(dest_root, direction):
+    """Reject a --dest-root that can't be right for the target OS (e.g. mangled by Git Bash)."""
+    if not dest_root:
+        return
+    if '"' in dest_root:
+        sys.exit("ERROR: --dest-root must not contain a double quote.")
+    win_style = re.match(r'^(?:[A-Za-z]:[\\/]|\\\\|//)', dest_root)
+    if direction == "win2mac" and not dest_root.startswith("/"):
+        hint = ""
+        if win_style:
+            hint = (" Git Bash converts arguments like /Users/... into Windows paths (MSYS path conversion);"
+                    " prefix the command with MSYS_NO_PATHCONV=1.")
+        sys.exit(f"ERROR: --dest-root for win2mac must be an absolute macOS path such as "
+                 f"/Users/user-name/Projects/myapp, got {dest_root!r}.{hint}")
+    if direction == "mac2win" and not win_style:
+        sys.exit(f"ERROR: --dest-root for mac2win must be a Windows path such as "
+                 f"C:/Users/user-name/Projects/myapp, got {dest_root!r}.")
+
+
+def root_regex(source_posix: str, windows_source: bool):
+    """Match the old project root in any spelling (C:/x, C:\\x, C:\\\\x, /c/x, file:///...),
+    but only as a whole path: C:/work/app must not match inside C:/work/app-old."""
+    posix = source_posix.replace("\\", "/").rstrip("/")
+    variants = {posix, posix.replace("/", "\\"), posix.replace("/", "\\\\")}
+    drive = re.match(r"^([A-Za-z]):/(.*)$", posix)
+    if drive:
+        variants.add(f"/{drive.group(1).lower()}/{drive.group(2)}")
+    alts = "|".join(re.escape(v) for v in sorted(variants, key=len, reverse=True))
+    return re.compile(r"(?<![\w.:-])(file:///?)?(?:" + alts + r")(?![\w.+@~-])",
+                      re.I if windows_source else 0)
+
+
+def replace_root(m, dest: str) -> str:
+    if m.group(1):                       # file URI: keep the scheme
+        return "file:///" + dest.lstrip("/")
+    if m.start() > 0 and m.string[m.start() - 1] == "/":
+        # //c/Users/... or //Users/... (absolute path in Claude Code permission rules)
+        drive = re.match(r"^([A-Za-z]):/(.*)$", dest)
+        return f"/{drive.group(1).lower()}/{drive.group(2)}" if drive else dest
+    return dest
 
 
 class Finding:
@@ -183,20 +275,29 @@ def cmd_stage(args) -> Path:
     source = Path(args.source).expanduser().resolve()
     if not source.is_dir():
         sys.exit(f"ERROR: source is not a directory: {source}")
+    check_dest_root(args.dest_root, args.direction)
     project_name = args.name or source.name
+    if (not project_name or project_name in (".", "..") or re.search(r"[\\/]", project_name)
+            or (os.name == "nt" and ":" in project_name)):
+        sys.exit(f"ERROR: --name must be a plain folder name, got {project_name!r}")
+    if args.direction == "mac2win":
+        project_name = sanitize_windows_name(project_name)
     exclude = set(DEFAULT_EXCLUDE_DIRS) | set(args.exclude or [])
-    exclude -= set(args.keep or [])
+    keep = set(args.keep or [])
+    if keep & NEVER_COPY_DIRS:
+        log(f"  not keeping {', '.join(sorted(keep & NEVER_COPY_DIRS))}: platform-specific binaries, regenerate them on the target")
+    exclude -= keep - NEVER_COPY_DIRS
     if args.exclude_git:
         exclude.add(".git")
 
-    staged_parent = Path(tempfile.mkdtemp(prefix="osmigration-"))
-    staged = staged_parent / project_name
+    staging_root = Path(tempfile.mkdtemp(prefix="osmigration-"))
+    staged = staging_root / project_name
     log(f"Staging copy of {source}")
     log(f"  -> {staged}")
     log(f"  excluding dirs: {', '.join(sorted(exclude))}")
 
     findings = []
-    symlinks = []
+    links = []          # win2mac: symlinks written into the zip as links by `package`
     skipped_dirs = []
     archive_suffix = "_to-transfer.zip"
 
@@ -205,31 +306,22 @@ def cmd_stage(args) -> Path:
         d = Path(dir_path)
         for n in names:
             p = d / n
-            if p.is_dir() and not p.is_symlink() and (n in exclude or n in JUNK_DIRS):
+            if n in JUNK_FILES or n.startswith(JUNK_PREFIXES):
+                ignored.add(n)
+            elif n.endswith((archive_suffix, "_" + REPORT_MD)) or (d == source and n in (REPORT_MD, STATE_FILE)):
+                ignored.add(n)   # don't nest a previous migration inside this one
+            elif (n in exclude or n in JUNK_DIRS) and p.is_dir():
                 ignored.add(n)
                 skipped_dirs.append(rel(p, source))
-            elif n in JUNK_FILES or n.startswith(JUNK_PREFIXES):
+            elif is_link(p) and skip_symlink(p, source, args.direction, findings, links):
                 ignored.add(n)
-            elif n.endswith(archive_suffix) or n == REPORT_MD or n == STATE_FILE:
-                ignored.add(n)   # don't nest a previous migration inside this one
-            if p.is_symlink():
-                symlinks.append(rel(p, source))
         return ignored
 
-    # mac->win: dereference symlinks (Windows needs admin rights to create them).
-    # win->mac: keep them as symlinks.
-    keep_symlinks = args.direction == "win2mac"
-    shutil.copytree(source, staged, symlinks=keep_symlinks, ignore=ignore,
-                    ignore_dangling_symlinks=True)
-
-    for s in symlinks:
-        if keep_symlinks:
-            findings.append(Finding("symlinks", "info", s,
-                                    "Symlink preserved in the copy.").to_dict())
-        else:
-            findings.append(Finding("symlinks", "fixed", s,
-                                    "Symlink replaced by a copy of its target (Windows cannot create symlinks without elevated rights).",
-                                    "If this was meant to stay a link, recreate it manually on Windows (mklink) or restructure.").to_dict())
+    try:
+        shutil.copytree(source, staged, symlinks=False, ignore=ignore)
+    except BaseException:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
 
     state = {
         "version": VERSION,
@@ -240,19 +332,81 @@ def cmd_stage(args) -> Path:
         "direction": args.direction,
         "dest_root": args.dest_root,
         "staged": str(staged),
+        "staging_root": str(staging_root),
+        "workdir": str(Path(args.workdir).expanduser().resolve()) if getattr(args, "workdir", None) else None,
         "excluded_dirs": sorted(exclude),
         "skipped_dirs": sorted(set(skipped_dirs)),
+        "links": links,
         "findings": findings,
         "steps_done": ["stage"],
     }
 
-    if args.include_global:
-        collect_global_extras(staged, state)
-
-    save_state(staged, state)
+    try:
+        if args.include_global:
+            collect_global_extras(staged, state)
+        save_state(staged, state)
+    except BaseException:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
     log(f"Staged. {len(skipped_dirs)} regenerable dir(s) skipped.")
     log(f"STAGED_DIR={staged}")
     return staged
+
+
+def is_link(p: Path) -> bool:
+    return p.is_symlink() or getattr(os.path, "isjunction", lambda _: False)(p)
+
+
+def skip_symlink(p: Path, source: Path, direction: str, findings: list, links: list) -> bool:
+    """Decide what happens to a symlink in the source. True means: leave it out of the copy."""
+    r = rel(p, source)
+    if direction == "win2mac":
+        # Never recreated on disk (that needs extra rights on Windows); `package` stores it as a link.
+        target = os.readlink(p)
+        if target.startswith("\\\\?\\"):
+            target = target[4:]
+        target = target.replace("\\", "/")
+        if re.match(r"^(?:[A-Za-z]:)?/", target):
+            findings.append(Finding("symlinks", "manual", r,
+                                    f"Symlink points to an absolute Windows path ({target}); left out of the archive.",
+                                    "Recreate it on the Mac with `ln -s` pointing at the right location.").to_dict())
+        else:
+            links.append({"path": r, "target": target})
+            findings.append(Finding("symlinks", "info", r, f"Symlink kept as a link -> {target}").to_dict())
+        return True
+
+    # mac2win: Windows can't create symlinks without extra rights, so the target is copied instead,
+    # but only when it lives inside the project. A link to e.g. ~/.ssh must never end up in the archive.
+    try:
+        target = p.resolve()
+    except (OSError, RuntimeError):
+        target = None
+    if target is None or not target.exists():
+        findings.append(Finding("symlinks", "info", r, "Dangling symlink; left out.").to_dict())
+        return True
+    if target != source and source not in target.parents:
+        findings.append(Finding("symlinks", "manual", r,
+                                f"Symlink points outside the project ({target}); left out so files from outside the project don't end up in the archive.",
+                                "Copy what's needed into the project, or recreate the link on Windows (mklink).").to_dict())
+        return True
+    if target.is_dir():
+        anc = p.parent
+        while True:
+            try:
+                if anc.resolve() == target:
+                    findings.append(Finding("symlinks", "manual", r,
+                                            "Symlink points to a folder that contains it (copying it would never end); left out.",
+                                            "Recreate it on Windows with `mklink /J` if it's needed.").to_dict())
+                    return True
+            except OSError:
+                pass
+            if anc == source or anc == anc.parent:
+                break
+            anc = anc.parent
+    findings.append(Finding("symlinks", "fixed", r,
+                            "Symlink replaced by a copy of its target (Windows cannot create symlinks without elevated rights).",
+                            "If this was meant to stay a link, recreate it manually on Windows (mklink) or restructure.").to_dict())
+    return False
 
 
 def collect_global_extras(staged: Path, state: dict):
@@ -311,7 +465,8 @@ def collect_global_extras(staged: Path, state: dict):
         "| agents/ | ~/.claude/agents/ | custom subagents |\n"
         "| skills/ | ~/.claude/skills/ | user skills |\n"
         "| mcp-servers.json | re-add with `claude mcp add-json <name> '<json>' -s user` | one entry per server |\n\n"
-        "Credentials are intentionally NOT included. Run `claude` and log in again on the target machine.\n",
+        "Claude Code login credentials are intentionally NOT included. Run `claude` and log in again on the target machine.\n"
+        "Note that MCP server `env` values (API tokens) and `settings.json` `env` entries ARE included as they are.\n",
         encoding="utf-8")
     state["global_extras"] = copied
     log(f"Collected user-level Claude extras: {', '.join(copied) or 'none found'}")
@@ -345,6 +500,44 @@ def scan_command_string(cmd: str, direction: str):
     return hits
 
 
+def is_mcp_node(relpath: str, jpath: str) -> bool:
+    """Only MCP server entries get the executable+args transforms; hooks, statusLine etc. are shell strings."""
+    return ".mcpServers." in jpath or relpath.endswith("mcp-servers.json")
+
+
+def scan_shell_command(findings, r, jpath, node, cmdline, hits, to_mac):
+    """Hooks, statusLine and other shell commands in Claude Code settings: reported, never auto-edited."""
+    kind = "hooks" if ".hooks" in jpath else "commands"
+    label = "Hook" if kind == "hooks" else "Command"
+    shell = str(node.get("shell") or "").lower()
+    if to_mac:
+        if shell in ("powershell", "pwsh"):
+            hits = hits + [f'runs with "shell": "{shell}"']
+        if hits:
+            findings.append(Finding(kind, "manual", r,
+                                    f"{label} at {jpath} uses Windows shell syntax: {cmdline!r} ({'; '.join(hits)})",
+                                    "Rewrite it for bash/zsh (see references/windows-to-macos.md, Hooks section).").to_dict())
+        return
+    mac_hits = [desc for rx, desc in MAC_ONLY_MARKERS if rx.search(cmdline)]
+    if mac_hits:
+        findings.append(Finding(kind, "manual", r,
+                                f"{label} at {jpath} uses macOS-only commands or paths: {cmdline!r} ({'; '.join(mac_hits)})",
+                                "Replace them with Windows equivalents (see references/macos-to-windows.md, Hooks section).").to_dict())
+    elif hits:
+        findings.append(Finding(kind, "info", r,
+                                f"{label} at {jpath} uses bash syntax: {cmdline!r} ({'; '.join(hits)})",
+                                "Claude Code runs it in Git Bash on Windows, so it keeps working once Git for Windows is installed "
+                                "(without Git Bash, hooks run in PowerShell).").to_dict())
+
+
+def secret_findings(findings, r, where, env):
+    for k, v in env.items():
+        if isinstance(v, str) and v and not v.startswith("${") and SECRET_KEY_RE.search(str(k)):
+            findings.append(Finding("secrets", "manual", r,
+                                    f"{where}.{k} looks like a secret and will be inside the archive.",
+                                    "Move the archive only over a channel you trust, or blank the value and set it again on the target.").to_dict())
+
+
 def walk_json_commands(obj, path="$"):
     """Yield (json_path, dict) for every dict that has a 'command' key (MCP servers, hooks)."""
     if isinstance(obj, dict):
@@ -373,6 +566,7 @@ def cmd_scan(args, staged: Path = None) -> dict:
     direction = state["direction"]
     findings = [f for f in state["findings"] if f["category"] not in ("scan",)]
     to_mac = direction == "win2mac"
+    src_rx = root_regex(state["source_posix"], to_mac)
     log(f"Scanning {staged} ({direction})")
 
     crlf_files, lf_files = [], []
@@ -406,6 +600,11 @@ def cmd_scan(args, staged: Path = None) -> dict:
         if text is None:
             continue
 
+        base = Path(r).name
+        if base.startswith(".env") and not base.endswith((".example", ".sample", ".template")):
+            findings.append(Finding("secrets", "info", r, "Environment file copied as-is; it may contain secrets.",
+                                    "Move the archive only over a channel you trust.").to_dict())
+
         # --- line endings
         if "\r\n" in text:
             crlf_files.append(r)
@@ -423,12 +622,7 @@ def cmd_scan(args, staged: Path = None) -> dict:
                 for jpath, node in walk_json_commands(data):
                     cmdline = " ".join([node["command"]] + [str(a) for a in node.get("args", [])])
                     hits = scan_command_string(cmdline, direction)
-                    is_hook = ".hooks" in jpath
-                    if is_hook and hits:
-                        findings.append(Finding("hooks", "manual", r,
-                                                f"Hook at {jpath} uses source-OS shell syntax: {cmdline!r} ({'; '.join(hits)})",
-                                                "Rewrite for the target shell (see references/<direction>.md, Hooks section).").to_dict())
-                    elif not is_hook:
+                    if is_mcp_node(r, jpath):
                         if to_mac and node["command"].lower() in ("cmd", "cmd.exe"):
                             findings.append(Finding("mcp", "info", r,
                                                     f"MCP server at {jpath} uses 'cmd /c' wrapper (auto-fixable).").to_dict())
@@ -437,20 +631,28 @@ def cmd_scan(args, staged: Path = None) -> dict:
                                                     f"MCP server at {jpath} runs '{node['command']}' directly; on Windows it needs 'cmd /c' (auto-fixable).").to_dict())
                         elif hits:
                             findings.append(Finding("mcp", "manual", r,
-                                                    f"Command at {jpath}: {cmdline!r} ({'; '.join(hits)})",
+                                                    f"MCP server at {jpath}: {cmdline!r} ({'; '.join(hits)})",
                                                     "Adjust for target OS.").to_dict())
+                    else:
+                        scan_shell_command(findings, r, jpath, node, cmdline, hits, to_mac)
                     env = node.get("env") or {}
-                    for k, v in env.items():
-                        if isinstance(v, str) and (WIN_ABS_RE.search(v) or MAC_ABS_RE.search(v)):
-                            findings.append(Finding("paths", "manual", r,
-                                                    f"MCP env {k}={v!r} at {jpath} contains an absolute path.",
-                                                    "Point it at the equivalent path on the target machine.").to_dict())
+                    if isinstance(env, dict):
+                        for k, v in env.items():
+                            if isinstance(v, str) and (WIN_ABS_RE.search(v) or MAC_ABS_RE.search(v)):
+                                findings.append(Finding("paths", "manual", r,
+                                                        f"MCP env {k}={v!r} at {jpath} contains an absolute path.",
+                                                        "Point it at the equivalent path on the target machine.").to_dict())
+                        secret_findings(findings, r, f"{jpath}.env", env)
+                if isinstance(data, dict) and isinstance(data.get("env"), dict):
+                    secret_findings(findings, r, "$.env", data["env"])
                 # permission rules with absolute paths
                 perms = data.get("permissions") if isinstance(data, dict) else None
                 if isinstance(perms, dict):
                     for key in ("allow", "deny", "ask", "additionalDirectories"):
                         for rule in perms.get(key, []) or []:
-                            if isinstance(rule, str) and (WIN_ABS_RE.search(rule) or MAC_ABS_RE.search(rule) or (to_mac and "\\" in rule)):
+                            if isinstance(rule, str) and (WIN_ABS_RE.search(rule) or MSYS_ABS_RE.search(rule)
+                                                          or MAC_ABS_RE.search(rule.replace("//", "/"))
+                                                          or (to_mac and "\\" in rule)):
                                 findings.append(Finding("permissions", "manual", r,
                                                         f"permissions.{key} rule {rule!r} contains an OS-specific path.",
                                                         "Use ~/ or a relative glob; forward slashes only.").to_dict())
@@ -510,11 +712,11 @@ def cmd_scan(args, staged: Path = None) -> dict:
         if p.suffix.lower() in SCAN_TEXT_EXT or base.startswith(".env") or base in ("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"):
             rx = WIN_ABS_RE if to_mac else MAC_ABS_RE
             for i, line in enumerate(text.splitlines(), 1):
-                m = rx.search(line)
+                m = rx.search(line) or (MSYS_ABS_RE.search(line) if to_mac else None)
                 if m and not line.lstrip().startswith(("#", "//")):
                     abs_path_hits += 1
                     if abs_path_hits <= 200:
-                        in_src = state["source_posix"].lower() in m.group(1).replace("\\\\", "/").replace("\\", "/").lower()
+                        in_src = bool(src_rx.search(line))
                         findings.append(Finding("paths", "info" if in_src and state.get("dest_root") else "manual", r,
                                                 f"Absolute path: {m.group(1)}", 
                                                 "Inside the project root: rewritten automatically if --dest-root was given. Otherwise replace with the target path." if in_src
@@ -523,7 +725,7 @@ def cmd_scan(args, staged: Path = None) -> dict:
 
     # --- .gitattributes / autocrlf
     ga = staged / ".gitattributes"
-    if not ga.exists() or "eol=" not in (read_text(ga) or ""):
+    if not ga.exists() or not has_eol_policy(read_text(ga)):
         findings.append(Finding("line-endings", "info", ".gitattributes",
                                 "No end-of-line policy defined (auto-fixable: convert adds one).").to_dict())
     gitcfg = staged / ".git" / "config"
@@ -574,14 +776,9 @@ def cmd_scan(args, staged: Path = None) -> dict:
 
 # --------------------------------------------------------------------------- convert
 
-def path_variants(p: str):
-    """All the spellings an absolute path might have inside text/JSON files."""
-    posix = p.replace("\\", "/")
-    win = posix.replace("/", "\\")
-    variants = {posix, win, win.replace("\\", "\\\\")}
-    # file URIs
-    variants.add("file:///" + posix.lstrip("/"))
-    return [v for v in variants if v]
+def has_eol_policy(gitattributes_text) -> bool:
+    """True if a catch-all `*` rule sets eol= (a rule for *.bat alone doesn't count)."""
+    return bool(re.search(r"(?m)^\s*\*\s+[^#\n]*\beol=", gitattributes_text or ""))
 
 
 def sanitize_windows_name(name: str) -> str:
@@ -598,6 +795,7 @@ def cmd_convert(args, staged: Path = None) -> dict:
     direction = state["direction"]
     to_mac = direction == "win2mac"
     dest_root = args.dest_root or state.get("dest_root")
+    check_dest_root(dest_root, direction)
     state["dest_root"] = dest_root
     findings = state["findings"]
     fixed = 0
@@ -622,14 +820,9 @@ def cmd_convert(args, staged: Path = None) -> dict:
                                         "Update any references to the old name in code/config.").to_dict())
 
     # 2. Per-file text transforms
-    src_variants = path_variants(state["source_posix"]) if dest_root else []
-    if dest_root:
-        dest_norm = dest_root.replace("\\", "/").rstrip("/")
-        if not to_mac and not re.match(r"^[A-Za-z]:/", dest_norm):
-            log("WARNING: --dest-root for Windows should look like C:/Users/you/Projects/name")
-        # For Windows targets we write forward slashes: valid for node, python, git, VS Code, Claude Code.
-        dest_for_text = dest_norm
-        dest_for_json = dest_norm  # forward slashes need no escaping
+    src_rx = root_regex(state["source_posix"], to_mac) if dest_root else None
+    # Forward slashes for Windows targets too: valid for node, python, git, VS Code, Claude Code, no JSON escaping.
+    dest_norm = dest_root.replace("\\", "/").rstrip("/") if dest_root else ""
     rewritten_paths = 0
     eol_fixed = 0
 
@@ -637,37 +830,29 @@ def cmd_convert(args, staged: Path = None) -> dict:
         r = rel(p, staged)
         if is_probably_binary(p):
             continue
+        suffix = p.suffix.lower()
         raw = p.read_bytes()
         try:
             text = raw.decode("utf-8")
             enc = "utf-8"
         except UnicodeDecodeError:
-            continue  # leave non-utf8 text alone
+            if not (suffix in SCAN_TEXT_EXT or p.name.startswith(".env") or has_shebang(p)):
+                continue  # unknown non-UTF-8 content: leave it alone
+            text = raw.decode("latin-1")   # round-trips every byte unchanged
+            enc = "latin-1"
         original = text
-        suffix = p.suffix.lower()
 
-        # 2a. absolute project-root path rewriting
-        if src_variants:
-            for v in sorted(src_variants, key=len, reverse=True):
-                if v in text:
-                    n = text.count(v)
-                    text = text.replace(v, dest_for_text)
-                    rewritten_paths += n
-                    findings.append(Finding("paths", "fixed", r,
-                                            f"Replaced {n} occurrence(s) of the old project root with {dest_for_text}").to_dict())
-                # case-insensitive match on Windows sources
-                elif to_mac and v.lower() in text.lower():
-                    rx = re.compile(re.escape(v), re.I)
-                    text, n = rx.subn(dest_for_text.replace("\\", "\\\\"), text)
-                    if n:
-                        rewritten_paths += n
-                        findings.append(Finding("paths", "fixed", r,
-                                                f"Replaced {n} occurrence(s) of the old project root (case-insensitive) with {dest_for_text}").to_dict())
-
-            # tails of rewritten paths still carry the source separators: fix them
-            if to_mac and dest_for_text in text:
-                tail_rx = re.compile(re.escape(dest_for_text) + r'((?:\\\\|\\)[^\s"\'<>|,;)\]]*)')
-                text = tail_rx.sub(lambda m: dest_for_text + m.group(1).replace("\\\\", "/").replace("\\", "/"), text)
+        # 2a. absolute project-root path rewriting (whole paths only, in a single pass)
+        if src_rx:
+            text, n = src_rx.subn(lambda m: replace_root(m, dest_norm), text)
+            if n:
+                rewritten_paths += n
+                findings.append(Finding("paths", "fixed", r,
+                                        f"Replaced {n} occurrence(s) of the old project root with {dest_norm}").to_dict())
+                # tails of rewritten paths still carry Windows separators: fix them
+                if to_mac:
+                    tail_rx = re.compile("(" + re.escape(dest_norm) + r")((?:\\\\|\\)[^\s\"'<>|,;)\]]*)")
+                    text = tail_rx.sub(lambda t: t.group(1) + t.group(2).replace("\\\\", "/").replace("\\", "/"), text)
 
         # 2b. MCP / Claude config JSON transforms
         if is_claude_config(r):
@@ -675,14 +860,17 @@ def cmd_convert(args, staged: Path = None) -> dict:
                 data = load_json_loose(text)
                 changed = False
                 for jpath, node in walk_json_commands(data):
-                    if ".hooks" in jpath:
-                        continue
+                    if not is_mcp_node(r, jpath):
+                        continue   # hooks, statusLine...: shell strings, reported by scan, never auto-edited
                     cmd = node["command"]
                     args_list = list(node.get("args") or [])
                     if to_mac:
-                        if cmd.lower() in ("cmd", "cmd.exe") and args_list and args_list[0].lower() in ("/c", "/k"):
-                            node["command"] = args_list[1] if len(args_list) > 1 else ""
-                            node["args"] = args_list[2:]
+                        if cmd.lower() in ("cmd", "cmd.exe") and args_list and str(args_list[0]).lower() in ("/c", "/k"):
+                            rest = args_list[1:]
+                            if len(rest) == 1 and isinstance(rest[0], str) and " " in rest[0] and '"' not in rest[0]:
+                                rest = rest[0].split()   # cmd /c "npx -y pkg"
+                            node["command"] = str(rest[0]) if rest else ""
+                            node["args"] = rest[1:]
                             changed = True
                             findings.append(Finding("mcp", "fixed", r,
                                                     f"{jpath}: removed 'cmd /c' wrapper -> {node['command']} {' '.join(node['args'])}").to_dict())
@@ -698,8 +886,14 @@ def cmd_convert(args, staged: Path = None) -> dict:
                         if "\\" in node["command"]:
                             node["command"] = node["command"].replace("\\", "/")
                             changed = True
-                        node["args"] = [a.replace("\\", "/") if isinstance(a, str) and re.search(r"\\[A-Za-z0-9_.]", a) else a
-                                        for a in node.get("args", [])]
+                            findings.append(Finding("mcp", "fixed", r, f"{jpath}: path separators in command changed to /").to_dict())
+                        if isinstance(node.get("args"), list):
+                            new_args = [a.replace("\\", "/") if isinstance(a, str) and WIN_PATH_ARG_RE.match(a) else a
+                                        for a in node["args"]]
+                            if new_args != node["args"]:
+                                node["args"] = new_args
+                                changed = True
+                                findings.append(Finding("mcp", "fixed", r, f"{jpath}: Windows path separators in args changed to /").to_dict())
                     else:
                         if cmd in NPM_CMD_SHIMS:
                             node["command"] = "cmd"
@@ -730,8 +924,16 @@ def cmd_convert(args, staged: Path = None) -> dict:
             text = new_text
 
         if text != original:
-            p.write_bytes(text.encode(enc))
-            fixed += 1
+            try:
+                p.write_bytes(text.encode(enc))
+                fixed += 1
+            except UnicodeEncodeError:
+                findings.append(Finding("paths", "manual", r,
+                                        "Not changed: the file isn't UTF-8 and the new project root can't be written in its encoding.",
+                                        "Update the paths in this file by hand.").to_dict())
+            except OSError as e:
+                findings.append(Finding("files", "manual", r, f"Could not write the converted file: {e}",
+                                        "Apply the change by hand.").to_dict())
 
     if eol_fixed:
         findings.append(Finding("line-endings", "fixed", "(project)",
@@ -744,7 +946,7 @@ def cmd_convert(args, staged: Path = None) -> dict:
     block = ("\n# Added by OSmigration: keep line endings deterministic across Windows and macOS\n"
              "* text=auto eol=lf\n*.bat text eol=crlf\n*.cmd text eol=crlf\n*.ps1 text eol=crlf\n")
     existing = read_text(ga) if ga.exists() else ""
-    if "eol=" not in (existing or ""):
+    if not has_eol_policy(existing):
         ga.write_text((existing or "").rstrip("\n") + ("\n" if existing else "") + block.lstrip("\n"), encoding="utf-8")
         fixed += 1
         findings.append(Finding("line-endings", "fixed", ".gitattributes",
@@ -790,7 +992,7 @@ def cmd_convert(args, staged: Path = None) -> dict:
 def cmd_package(args, staged: Path = None) -> Path:
     staged = staged or Path(args.staged).resolve()
     state = load_state(staged)
-    workdir = Path(args.workdir or os.getcwd()).resolve()
+    workdir = resolve_workdir(args, state)
     workdir.mkdir(parents=True, exist_ok=True)
     name = f"{state['project_name']}_to-transfer.zip"
     out = workdir / name
@@ -804,27 +1006,27 @@ def cmd_package(args, staged: Path = None) -> Path:
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for root, dirs, files in os.walk(staged):
             r = Path(root)
-            for d in dirs:
-                dp = r / d
-                if dp.is_symlink():
-                    add_symlink(zf, dp, f"{state['project_name']}/{rel(dp, staged)}")
             for f in files:
                 fp = r / f
-                if f == STATE_FILE:
+                if (f == STATE_FILE and r == staged) or fp.is_symlink():
                     continue
-                arc = f"{state['project_name']}/{rel(fp, staged)}"
-                if fp.is_symlink():
-                    add_symlink(zf, fp, arc)
-                    continue
-                zi = zipfile.ZipInfo.from_file(fp, arc)
+                relpath = rel(fp, staged)
+                arc = f"{state['project_name']}/{relpath}"
+                # strict_timestamps=False: files dated before 1980 are clamped instead of aborting
+                zi = zipfile.ZipInfo.from_file(fp, arc, strict_timestamps=False)
                 zi.compress_type = zipfile.ZIP_DEFLATED
-                mode = fp.stat().st_mode & 0o7777 or 0o644
-                if rel(fp, staged) in exec_set:
+                # Mark entries as made on Unix; otherwise extractors such as libarchive ignore the mode bits.
+                zi.create_system = 3
+                # Windows has no meaningful mode bits (every file reads as 0o666): use 644/755.
+                mode = 0o644 if os.name == "nt" else (fp.stat().st_mode & 0o777 or 0o644)
+                if relpath in exec_set:
                     mode |= 0o111
                 zi.external_attr = (stat.S_IFREG | mode) << 16
-                with open(fp, "rb") as fh:
-                    zf.writestr(zi, fh.read())
+                with open(fp, "rb") as src, zf.open(zi, "w", force_zip64=zi.file_size > 0x7F000000) as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
                 count += 1
+        for link in state.get("links", []):
+            add_symlink(zf, f"{state['project_name']}/{link['path']}", link["target"])
     # copy the report next to the archive too
     shutil.copy2(staged / REPORT_MD, workdir / f"{state['project_name']}_MIGRATION_REPORT.md")
     size_mb = out.stat().st_size / (1024 * 1024)
@@ -832,15 +1034,43 @@ def cmd_package(args, staged: Path = None) -> Path:
     log(f"Report copied to: {workdir / (state['project_name'] + '_MIGRATION_REPORT.md')}")
     log(f"ARCHIVE={out}")
     if not args.keep_staging:
-        shutil.rmtree(staged.parent, ignore_errors=True)
-        log("Staging directory removed.")
+        remove_staging(staged, state)
     else:
         log(f"Staging directory kept at {staged}")
     return out
 
 
-def add_symlink(zf: zipfile.ZipFile, path: Path, arcname: str):
-    target = os.readlink(path)
+def resolve_workdir(args, state: dict) -> Path:
+    """--workdir, else the current directory, unless that is inside the source project (never write there)."""
+    chosen = getattr(args, "workdir", None) or state.get("workdir")
+    if chosen:
+        return Path(chosen).expanduser().resolve()
+    workdir = Path.cwd().resolve()
+    source = Path(state["source"])
+    if workdir == source or source in workdir.parents:
+        workdir = source.parent
+        log(f"Current directory is inside the source project; writing the archive next to it instead: {workdir}")
+    return workdir
+
+
+def remove_staging(staged: Path, state: dict):
+    """Delete the temp dir created by `stage`, and nothing else: a staged copy that was moved,
+    or a state file that doesn't match, leaves everything in place."""
+    root = Path(state.get("staging_root") or "")
+    try:
+        ok = (root.name.startswith("osmigration-")
+              and staged.parent.resolve() == root.resolve()
+              and set(os.listdir(root)) <= {staged.name})
+    except OSError:
+        ok = False
+    if ok:
+        shutil.rmtree(root, ignore_errors=True)
+        log("Staging directory removed.")
+    else:
+        log(f"Staging directory left in place (not the temp folder this tool created): {staged}")
+
+
+def add_symlink(zf: zipfile.ZipFile, arcname: str, target: str):
     zi = zipfile.ZipInfo(arcname)
     zi.create_system = 3
     zi.external_attr = (stat.S_IFLNK | 0o777) << 16
@@ -948,7 +1178,7 @@ def build_parser():
         sp.add_argument("--name", help="project name for the archive (default: folder name)")
         sp.add_argument("--source-root", help="how the project root is spelled inside its own files if different from the real path (e.g. a mapped drive or junction)")
         sp.add_argument("--exclude", action="append", metavar="DIR", help="extra directory name to skip (repeatable)")
-        sp.add_argument("--keep", action="append", metavar="DIR", help="directory name to keep even if normally excluded (repeatable)")
+        sp.add_argument("--keep", action="append", metavar="DIR", help="directory name to keep even if normally excluded (repeatable; node_modules and virtualenvs are never kept)")
         sp.add_argument("--exclude-git", action="store_true", help="do not copy the .git directory")
         sp.add_argument("--include-global", action="store_true",
                         help="also collect user-level Claude Code config (~/.claude/CLAUDE.md, commands, agents, MCP servers) into _claude-global-extras/")
@@ -965,18 +1195,26 @@ def build_parser():
     sp.add_argument("--dest-root")
     sp = sub.add_parser("package", help="zip the staged copy into <workdir>/<project>_to-transfer.zip")
     add_staged_arg(sp)
-    sp.add_argument("--workdir", help="where to write the archive (default: current directory)")
+    workdir_help = ("where to write the archive (default: current directory, or the project's parent folder "
+                    "if the current directory is inside the project)")
+    sp.add_argument("--workdir", help=workdir_help)
     sp.add_argument("--keep-staging", action="store_true", help="do not delete the temp staging dir afterwards")
     for name, help_ in (("prepare", "stage + scan + convert, then stop for manual review"),
                         ("all", "stage + scan + convert + package in one go")):
         sp = sub.add_parser(name, help=help_)
         add_stage_args(sp)
-        sp.add_argument("--workdir")
-        sp.add_argument("--keep-staging", action="store_true")
+        sp.add_argument("--workdir", help=workdir_help + "; remembered for a later `package`")
+        sp.add_argument("--keep-staging", action="store_true", help="do not delete the temp staging dir afterwards")
     return p
 
 
 def main(argv=None):
+    # Project paths can contain any character; don't crash on a cp1252 console or pipe.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     if args.cmd == "stage":
         cmd_stage(args)
@@ -988,13 +1226,18 @@ def main(argv=None):
         cmd_package(args)
     elif args.cmd in ("prepare", "all"):
         staged = cmd_stage(args)
-        cmd_scan(args, staged)
-        cmd_convert(args, staged)
-        if args.cmd == "all":
-            cmd_package(args, staged)
-        else:
+        try:
+            cmd_scan(args, staged)
+            cmd_convert(args, staged)
+            if args.cmd == "all":
+                cmd_package(args, staged)
+        except BaseException:
+            shutil.rmtree(staged.parent, ignore_errors=True)   # the fresh temp dir from cmd_stage
+            log(f"Failed; removed the temp staging dir {staged.parent}")
+            raise
+        if args.cmd == "prepare":
             log("\nStaged copy is ready for manual edits. When done:")
-            log(f"  python {Path(__file__).name} package --staged \"{staged}\"")
+            log(f"  python \"{Path(__file__).resolve()}\" package --staged \"{staged}\"")
 
 
 if __name__ == "__main__":

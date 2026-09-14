@@ -11,18 +11,19 @@ staged copy only.
 | Global config, user-scope + local-scope MCP servers | `C:\Users\<you>\.claude.json` | `~/.claude.json` |
 | Project settings | `.claude\settings.json`, `.claude\settings.local.json` | same, forward slashes |
 | Project MCP servers | `.mcp.json` | `.mcp.json` |
-| Credentials | Windows Credential Manager | macOS Keychain (log in again) |
-| Shell used for Bash tool and hooks | Git Bash | `/bin/zsh` or `/bin/bash` |
+| Credentials | `%USERPROFILE%\.claude\.credentials.json` (never copied) | macOS Keychain (log in again) |
+| Shell used for Bash tool and hooks | Git Bash (PowerShell when Git Bash is missing, or for hooks with `"shell": "powershell"`) | zsh/bash |
 
 ## MCP server entries
 
-The script already strips `cmd /c` and `.cmd`/`.exe` suffixes. Check what's left:
+The script already strips `cmd /c` and `.cmd`/`.exe` suffixes and turns backslashes in path-like
+args into `/`. Check what's left:
 
 | Windows | macOS |
 |---|---|
 | `"command": "cmd", "args": ["/c", "npx", ...]` | `"command": "npx", "args": [...]` |
 | `"command": "python"` | `"command": "python3"` (or the venv's `python`) |
-| `"command": "C:\\Users\\user-name\\AppData\\Roaming\\npm\\node.exe"` | `"command": "node"` (rely on PATH) |
+| `"command": "C:\\Users\\user-name\\AppData\\Roaming\\npm\\node.exe"` | `"command": "node"` (rely on PATH; the script only strips `.exe` and flips the slashes, so replace the leftover Windows path) |
 | `"command": "uvx"` | `"command": "uvx"` (install uv with brew) |
 | `"env": {"HOME": "C:\\Users\\user-name"}` | usually drop; zsh sets HOME |
 | args with `C:\\...` outside the project | equivalent `~/...` path or `${HOME}`-free absolute path |
@@ -32,12 +33,13 @@ Note: MCP `command` is not run through a shell, so `~` and `$HOME` are **not** e
 
 ## Hooks (`.claude/settings*.json` → `hooks`)
 
-Hooks run through the user's shell. PowerShell syntax has to be rewritten.
+Hooks run in bash on macOS. PowerShell syntax has to be rewritten.
 
 | PowerShell / cmd | bash / zsh |
 |---|---|
 | `powershell -c "..."` / `pwsh -c "..."` | drop the wrapper; write the command directly |
-| `$env:CLAUDE_FILE_PATH` | `$CLAUDE_FILE_PATH` |
+| `"shell": "powershell"` on the hook | remove the field (bash is the default) and rewrite the command |
+| `$env:MY_VAR` | `$MY_VAR` |
 | `%CLAUDE_PROJECT_DIR%` | `$CLAUDE_PROJECT_DIR` |
 | `Get-Content file` / `type file` | `cat file` |
 | `Write-Output "x"` / `echo x` | `echo x` |
@@ -90,8 +92,10 @@ follow it literally.
 
 ## Permission rules (`permissions.allow` / `deny`)
 
-`Read(C:\Users\user-name\**)` → `Read(~/**)` or `Read(./**)`. Always forward slashes. Bash rules
-(`Bash(npm run *)`) are unchanged.
+Claude Code on Windows writes absolute paths as `//c/Users/...`. `Read(//c/Users/user-name/**)` or
+`Read(C:\Users\user-name\**)` → `Read(~/**)` or `Read(./**)`. Always forward slashes. Rules pointing
+inside the project were already rewritten to `//Users/...`. Bash rules (`Bash(npm run *)`) are
+unchanged.
 
 ## Git
 

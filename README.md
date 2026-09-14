@@ -36,16 +36,17 @@ OSmigration finds all of that, fixes the mechanical parts automatically, and lea
 | **Paths** | Every reference to the old project root rewritten to the new location (`--dest-root`) | Absolute paths that point *outside* the project |
 | **Line endings** | Normalised to LF (CRLF kept for `.bat/.cmd/.ps1`), `.gitattributes` policy added | `core.autocrlf` in repo config |
 | **Files** | Regenerable dirs skipped (`node_modules`, `.venv`, `dist`, `target`…), junk removed (`.DS_Store`, `Thumbs.db`) | Case‑only filename collisions |
-| **macOS → Windows** | Invalid filenames renamed (`<>:"\|?*`, `CON`, trailing dots), symlinks replaced by copies | Long paths, `.sh` scripts |
-| **Windows → macOS** | `.sh` / shebang files marked executable inside the zip | `.bat` / `.ps1` scripts |
+| **macOS → Windows** | Invalid filenames renamed (`<>:"\|?*`, `CON`, trailing dots), symlinks inside the project replaced by copies | Symlinks pointing outside the project, long paths, `.sh` scripts |
+| **Windows → macOS** | `.sh` / shebang files marked executable, symlinks kept as links | `.bat` / `.ps1` scripts, PowerShell hooks |
 | **Scripts** | — | `package.json` scripts, Makefile, CI steps using the wrong shell |
+| **Secrets** | — | `.env` files and token-like MCP `env` values that travel inside the archive |
 | **User‑level config** | Optional: global `CLAUDE.md`, slash commands, agents, MCP servers from `~/.claude.json` | — |
 
-> 🔒 **The original project is never modified.** Every change happens in a temporary copy. Credentials are never copied.
+> 🔒 **The original project is never modified.** Every change happens in a temporary copy, and the archive is written outside the project. Claude Code login credentials are never copied; project secrets such as `.env` files travel with the project and are listed in the report.
 
 ## 📦 Output
 
-Two files land in the directory you launched Claude from:
+Two files land in the directory you launched Claude from (or next to the project, if you launched Claude inside it):
 
 ```
 myapp_to-transfer.zip          ← the adapted project (+ MIGRATION_REPORT.md inside)
@@ -84,8 +85,9 @@ The report contains: what was changed, what still needs a decision (with file an
 
 ```bash
 git clone https://github.com/alex-luncan/claude-code-migrate.git
-cp -r claude-code-migrate ~/.claude/skills/osmigration        # macOS
+mkdir -p ~/.claude/skills && cp -r claude-code-migrate ~/.claude/skills/osmigration        # macOS
 # or on Windows (PowerShell):
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\skills" | Out-Null
 Copy-Item -Recurse claude-code-migrate "$env:USERPROFILE\.claude\skills\osmigration"
 ```
 
@@ -140,7 +142,8 @@ package  ──►  PROJECTNAME_to-transfer.zip in your working directory ◄─
 
 ```bash
 # Windows → macOS, review step in between
-python scripts/migrate.py prepare "C:\Users\user-name\Projects\myapp" \
+# (in Git Bash, MSYS_NO_PATHCONV=1 stops /Users/... from being turned into a Windows path)
+MSYS_NO_PATHCONV=1 python scripts/migrate.py prepare "C:\Users\user-name\Projects\myapp" \
     --direction win2mac \
     --dest-root /Users/user-name/Projects/myapp \
     --include-global
@@ -171,10 +174,10 @@ python3 scripts/migrate.py all ~/Projects/myapp \
 | `--dest-root PATH` | where the project will live on the target; enables path rewriting |
 | `--source-root PATH` | how the project root is spelled inside its files if different from the real path (mapped drive, junction, WSL `/mnt/c/...`) |
 | `--include-global` | collect `~/.claude/{CLAUDE.md,settings.json,commands,agents,skills}` and MCP servers from `~/.claude.json` into `_claude-global-extras/` |
-| `--exclude DIR` / `--keep DIR` | adjust the list of skipped directories |
+| `--exclude DIR` / `--keep DIR` | adjust the list of skipped directories (`node_modules` and virtualenvs are never kept) |
 | `--exclude-git` | leave `.git` out of the archive |
-| `--name NAME` | archive name other than the folder name |
-| `--workdir DIR` | where to write the archive (default: current directory) |
+| `--name NAME` | archive name other than the folder name (a plain name, not a path) |
+| `--workdir DIR` | where to write the archive (default: current directory, or next to the project if you're inside it) |
 | `--keep-staging` | don't delete the temp copy after packaging |
 
 </details>
@@ -208,7 +211,8 @@ claude-code-migrate/
 - **Forward slashes for Windows paths.** `C:/Users/user-name/...` works in JSON configs, Node, Python, Git and Claude Code, and needs no escaping.
 - **Hooks are never auto‑translated.** A wrong hook fails silently or blocks every edit. They're flagged with the exact command and a translation table instead.
 - **`node_modules` is never copied**, even on request. Native binaries are platform‑specific; the lockfile regenerates them exactly.
-- **Git Bash awareness.** Claude Code on Windows runs bash commands through Git Bash, so bash‑style hooks are reported as *info*, not errors, when going mac → win.
+- **Git Bash awareness.** Claude Code on Windows runs bash commands through Git Bash, so bash‑style hooks are reported as *info*, not errors, when going mac → win; only hooks using mac‑only commands (`brew`, `open`, `pbcopy`…) need manual work.
+- **Nothing from outside the project.** Going mac → win, symlinks that point outside the project are left out instead of copied, so a link to something like `~/.ssh` can't end up in the archive.
 
 ## 🤝 Contributing
 

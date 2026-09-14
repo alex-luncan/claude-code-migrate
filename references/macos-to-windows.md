@@ -11,8 +11,8 @@ staged copy only.
 | Global config, user-scope + local-scope MCP servers | `~/.claude.json` | `C:\Users\<you>\.claude.json` |
 | Project settings | `.claude/settings.json`, `.claude/settings.local.json` | same |
 | Project MCP servers | `.mcp.json` | `.mcp.json` |
-| Credentials | macOS Keychain | Windows Credential Manager (log in again) |
-| Shell used for Bash tool and hooks | zsh/bash | **Git Bash** (must be installed; PowerShell is not used by the Bash tool) |
+| Credentials | macOS Keychain | `%USERPROFILE%\.claude\.credentials.json` (log in again) |
+| Shell used for Bash tool and hooks | zsh/bash | **Git Bash** (install Git for Windows; without it Claude Code falls back to PowerShell) |
 
 Because Claude Code on Windows drives Git Bash, bash-style hooks and `.sh` scripts often keep
 working as long as they avoid mac-only commands. Do not convert them to PowerShell unless the
@@ -36,7 +36,9 @@ Forward slashes (`C:/Users/user-name/...`) are valid in JSON configs on Windows 
 
 ## Hooks (`.claude/settings*.json` → `hooks`)
 
-Hooks run through Git Bash on Windows, so most bash stays. Replace what Git Bash lacks:
+Hooks run through Git Bash on Windows (once Git for Windows is installed), so most bash stays. The
+report lists bash hooks as notes and only flags the ones using mac-only commands. Replace what Git
+Bash lacks:
 
 | macOS-only | Works on Windows (Git Bash) |
 |---|---|
@@ -51,7 +53,7 @@ Hooks run through Git Bash on Windows, so most bash stays. Replace what Git Bash
 | `chmod +x` | no-op on Windows; remove |
 | `sudo x` | remove; run terminal as admin if truly needed |
 
-If the user prefers native PowerShell hooks, prefix with `powershell -NoProfile -c "..."` and use
+If the user prefers native PowerShell hooks, add `"shell": "powershell"` to the hook and use
 `$env:VAR` for environment variables.
 
 ## `package.json` scripts and other command strings
@@ -84,8 +86,9 @@ The script renamed anything Windows rejects (`<>:"|?*`, trailing dots/spaces, `C
 on the target run `git config core.longpaths true` or enable
 `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled`.
 
-Symlinks were replaced with copies. If a link is essential, recreate it with
-`mklink` (needs Developer Mode or admin) after extracting.
+Symlinks pointing inside the project were replaced with copies; links pointing outside it (or at
+one of their own parent folders) were left out and are listed in the report. If a link is
+essential, recreate it with `mklink` (needs Developer Mode or admin) after extracting.
 
 ## Environment variables
 
@@ -103,7 +106,9 @@ bash commands (or vice versa).
 
 ## Permission rules
 
-`Read(/Users/user-name/**)` → `Read(~/**)` or `Read(./**)`; keep forward slashes.
+`Read(/Users/user-name/**)` → `Read(~/**)` or `Read(./**)`; keep forward slashes. Claude Code on
+Windows writes absolute paths as `//c/Users/...`; rules pointing inside the project were already
+rewritten to that form.
 
 ## Git
 

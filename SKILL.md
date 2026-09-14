@@ -29,18 +29,26 @@ under the source path. All edits happen in the staged copy.
 
 Also ask whether to include user-level Claude Code config (`--include-global`): global CLAUDE.md,
 custom slash commands, agents, and user-scoped MCP servers from `~/.claude.json`. These live
-outside the repo and are the most common thing people forget. Credentials are never copied.
+outside the repo and are the most common thing people forget. Claude Code login credentials are
+never copied, but project files such as `.env` and MCP `env` values travel as they are; the report
+lists likely secrets so the user can decide before moving the archive.
 
 ### 2. Run `prepare` (stage + scan + convert), not `all`
 
 ```bash
-python scripts/migrate.py prepare "<source>" --direction win2mac \
+MSYS_NO_PATHCONV=1 python "${CLAUDE_SKILL_DIR}/scripts/migrate.py" prepare "<source>" --direction win2mac \
     --dest-root /Users/user-name/Projects/myapp --include-global
 ```
 
-`prepare` stops after converting so the manual items can be handled before packaging. On Windows
-use `python`; on macOS `python3` (stdlib only, Python 3.8+). The command prints `STAGED_DIR=...`
-and `REPORT=...`; read the report.
+Run it from the directory Claude was launched in (don't `cd` into the skill folder); `package`
+writes the archive there later. `prepare` stops after converting so the manual items can be handled
+before packaging. On Windows use `python`; on macOS `python3` (stdlib only, Python 3.8+).
+
+Keep the `MSYS_NO_PATHCONV=1` prefix on Windows: without it Git Bash rewrites `/Users/...` into
+`C:/Program Files/Git/Users/...` before the script sees it (the script then refuses the
+`--dest-root`). It is harmless on macOS; leave it out only when the shell is PowerShell.
+
+The command prints `STAGED_DIR=...` and `REPORT=...`; read the report.
 
 What the script does automatically in the staged copy:
 
@@ -51,20 +59,22 @@ What the script does automatically in the staged copy:
 - MCP servers in `.mcp.json` / `.claude/*.json`: removes or adds the `cmd /c` wrapper that npm
   shims need on Windows, swaps `python`↔`python3`, fixes separators in args
 - rewrites the old project root to `--dest-root` everywhere (configs, `.env`, CLAUDE.md, code)
-- mac→win: renames files with characters/names Windows rejects, replaces symlinks with copies
-- win→mac: marks `.sh` and shebang files executable inside the zip
+- mac→win: renames files with characters/names Windows rejects, replaces symlinks that point inside
+  the project with copies (links pointing outside the project are left out and reported)
+- win→mac: marks `.sh` and shebang files executable inside the zip and stores symlinks as links
 
-What it only reports (needs judgement): hook commands, `package.json` scripts, Makefiles/CI
-steps, CLAUDE.md instructions, permission rules, absolute paths outside the project, filename
-case collisions, `.bat`/`.ps1` scripts.
+What it only reports (needs judgement): hook and statusLine commands, `package.json` scripts,
+Makefiles/CI steps, CLAUDE.md instructions, permission rules, absolute paths outside the project,
+filename case collisions, `.bat`/`.ps1` scripts, likely secrets (`.env` files, token-like MCP
+`env` values).
 
 ### 3. Work the manual list in the staged copy
 
 Open the report's *Manual actions required* section and fix each item by editing files under
 `STAGED_DIR` (never the source). Use the reference for the direction:
 
-- `references/windows-to-macos.md` for `win2mac`
-- `references/macos-to-windows.md` for `mac2win`
+- `${CLAUDE_SKILL_DIR}/references/windows-to-macos.md` for `win2mac`
+- `${CLAUDE_SKILL_DIR}/references/macos-to-windows.md` for `mac2win`
 
 They contain the translation tables for hooks, npm scripts, shell commands, env vars, and the
 Claude Code config locations on each OS. Typical edits:
@@ -76,17 +86,18 @@ Claude Code config locations on each OS. Typical edits:
 - resolve case-only filename collisions (pick one; both OSes are case-insensitive by default)
 
 If an item is something only the user can decide (an absolute path to a tool that may not exist
-on the other machine), leave it and say so; the report travels with the archive so they can finish
+on the other machine, or whether a secret should travel), leave it and say so; the report travels with the archive so they can finish
 it on the target. Show the user a short summary of what you changed and what remains.
 
 ### 4. Package
 
 ```bash
-python scripts/migrate.py package --staged "<STAGED_DIR>"
+python "${CLAUDE_SKILL_DIR}/scripts/migrate.py" package --staged "<STAGED_DIR>"
 ```
 
-Writes `<project>_to-transfer.zip` and `<project>_MIGRATION_REPORT.md` to the current directory
-(`--workdir` to change), then deletes the temp staging dir (`--keep-staging` to retain it). Tell
+Writes `<project>_to-transfer.zip` and `<project>_MIGRATION_REPORT.md` to the current directory, or
+next to the project when the current directory is inside it (`--workdir` to change), then deletes
+the temp staging dir (`--keep-staging` to retain it). Tell
 the user the archive path and the top three things to do on the target machine (the report's
 final checklist has the full list: reinstall deps, log in to `claude` again, restore extras,
 `/doctor`).
@@ -109,11 +120,14 @@ read the report afterwards and relay the manual items.
 
 - Line endings go to LF in both directions. Windows tooling is fine with LF; CRLF `.sh` files break
   on macOS with "bad interpreter". Only `.bat/.cmd/.ps1` stay CRLF.
-- On Windows Claude Code runs commands through Git Bash, so bash-style hooks and `.sh` scripts can
-  still work there if they avoid mac-only commands (`brew`, `open`, `sed -i ''`). PowerShell hooks
-  never work on macOS.
+- On Windows Claude Code runs the Bash tool and hooks through Git Bash, so bash-style hooks and `.sh`
+  scripts keep working there if they avoid mac-only commands (`brew`, `open`, `sed -i ''`). Without
+  Git Bash, hooks run in PowerShell, so Git for Windows belongs on the target's install list.
+  PowerShell hooks (or `"shell": "powershell"`) need `pwsh` on a Mac; rewrite them in bash.
 - `~/.claude.json` (global) holds user-scope MCP servers and per-project local-scope servers; only
   `.mcp.json` in the repo travels with the project. `--include-global` extracts the rest.
-- Do not copy `node_modules` or a virtualenv even if the user asks to "copy everything"; explain
-  that native binaries in them are platform-specific and the lockfile regenerates them exactly.
-- Auth never transfers (Keychain on macOS, Credential Manager on Windows); the user logs in again.
+- Do not copy `node_modules` or a virtualenv even if the user asks to "copy everything" (the script
+  ignores `--keep` for them); explain that native binaries in them are platform-specific and the
+  lockfile regenerates them exactly.
+- Auth never transfers (Keychain on macOS, `%USERPROFILE%\.claude\.credentials.json` on Windows,
+  which the script never copies); the user logs in again.
